@@ -1,0 +1,81 @@
+name: Validate SaveAt jump gaps
+
+on:
+  push:
+    branches: [codex/validate-save-times-across-jump-gaps]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install native dependencies and record source
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          uv run echo done
+          uv pip freeze > evidence/requirements.txt
+          git rev-parse HEAD > evidence/validation-head.txt
+          git rev-parse HEAD^ > evidence/code-head.txt
+          sha256sum diffrax/_integrate.py test/test_adaptive_stepsize_controller.py > evidence/source.sha256
+      - name: Regressions on unchanged upstream
+        run: |
+          set -euo pipefail
+          git show e950aa2cf1974c02816c1542f20beabf7cca496b:diffrax/_integrate.py > diffrax/_integrate.py
+          set +e
+          uv run pytest test/test_adaptive_stepsize_controller.py -k 'save_times_across_terminal_jump or save_jump_gap_carries_state_and_requested_time' --junitxml=evidence/before.xml > evidence/before.log 2>&1
+          result=$?
+          set -e
+          git restore diffrax/_integrate.py
+          cat evidence/before.log
+          test "$result" -eq 1
+          uv run python - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = list(ET.parse('evidence/before.xml').iter('testcase'))
+          assert len(cases) == 5
+          assert sum(c.find('failure') is not None for c in cases) == 4
+          assert all(c.find('error') is None and c.find('skipped') is None for c in cases)
+          PY
+          sha256sum --check evidence/source.sha256
+      - name: Regressions on candidate
+        run: |
+          set -euo pipefail
+          uv run pytest test/test_adaptive_stepsize_controller.py -k 'save_times_across_terminal_jump or save_jump_gap_carries_state_and_requested_time' --junitxml=evidence/after.xml | tee evidence/after.log
+      - name: All native pre-commit hooks
+        run: |
+          set -euo pipefail
+          uv run prek run --all-files | tee evidence/prek.log
+          git diff --exit-code
+      - name: Complete native test runner
+        run: |
+          set -euo pipefail
+          uv run python -m test | tee evidence/native.log
+      - name: Build native documentation
+        if: always()
+        run: |
+          set -euo pipefail
+          uv run mkdocs build | tee evidence/docs.log
+      - name: Verify tested source
+        if: always()
+        run: |
+          set -euo pipefail
+          sha256sum --check evidence/source.sha256
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diffrax-jump-save-${{ matrix.python }}
+          path: evidence
